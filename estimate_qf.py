@@ -9,18 +9,14 @@ Example:
     python3 estimate_qf.py echidna:-a-fast-smart-contract-fuzzer 16
 
 Method:
-    QF formula used by Giveth:  matching_p = pool * S_p^2 / sum_q(S_q^2)
-    where S_p = sum over donors d of sqrt(donor_d_total_to_project_p).
-    We page every donation for every project in the round, group by donor wallet,
-    take sqrt of each donor total, sum them, square the result.
-
-Caveats:
-    Giveth applies passport / sybil filters when computing the on-platform
-    estimate (the API's `projectDonationsSqrtSum` reflects the filtered S_p,
-    which is generally higher than what this script computes from raw donations
-    because rejected donors are excluded entirely rather than partly counted).
-    Treat this script's output as an upper-bound-shaped approximation that
-    ignores anti-sybil weighting.
+    Matching formula:           matching_p = pool * S_p^2 / sum_q(S_q^2)
+    Giveth's per-project S_p:   sum over each donation row in the round of
+                                sqrt(donation.valueUsd).
+    (Note: this is NOT canonical QF, which would group by donor first. The
+    impact-graph backend reproduces this script's number — verified against
+    the live `projectDonationsSqrtSum` field.)
+    No COCM / passport / sybil clustering is applied here; that adjustment
+    is run off-chain at distribution time by Giveth's COCM_QF_Algorithm.
 """
 
 import json
@@ -95,7 +91,9 @@ def gql(query, variables=None, retries=5):
 
 
 def project_sqrt_sum(project_id, qf_round_id):
-    donor_totals = defaultdict(float)
+    sqrt_sum = 0.0
+    donations_counted = 0
+    donor_addrs = set()
     skip, take = 0, 200
     while True:
         d = gql(
@@ -103,14 +101,17 @@ def project_sqrt_sum(project_id, qf_round_id):
             {"projectId": project_id, "skip": skip, "take": take, "qfRoundId": qf_round_id},
         )["donationsByProject"]
         for row in d["donations"]:
-            addr = (row.get("fromWalletAddress") or "").lower()
             v = row.get("valueUsd") or 0
-            if addr and v > 0:
-                donor_totals[addr] += v
+            if v > 0:
+                sqrt_sum += math.sqrt(v)
+                donations_counted += 1
+                addr = (row.get("fromWalletAddress") or "").lower()
+                if addr:
+                    donor_addrs.add(addr)
         if skip + take >= d["total"]:
             break
         skip += take
-    return sum(math.sqrt(v) for v in donor_totals.values()), len(donor_totals)
+    return sqrt_sum, donations_counted, len(donor_addrs)
 
 
 def main():
@@ -138,16 +139,18 @@ def main():
 
     total_score = 0.0
     target_sqrt_sum = 0.0
+    target_donations = 0
     target_donors = 0
     for i, p in enumerate(projects, 1):
         pid = int(p["id"])
         qf = next((r for r in p["projectQfRounds"] if r["qfRoundId"] == round_id), None)
         if not qf or (qf["sumDonationValueUsd"] or 0) <= 0:
             continue
-        s, donors = project_sqrt_sum(pid, round_id)
+        s, donations, donors = project_sqrt_sum(pid, round_id)
         total_score += s * s
         if pid == project_id:
             target_sqrt_sum = s
+            target_donations = donations
             target_donors = donors
         if i % 20 == 0:
             print(f"  {i}/{len(projects)} projects done")
@@ -159,7 +162,8 @@ def main():
     print()
     print(f"=== {project['title']} — round {round_id} ({round_info['name']}) ===")
     print(f"  Raised in round:        ${project_qf['sumDonationValueUsd']:,.2f}")
-    print(f"  Unique donors:          {target_donors}")
+    print(f"  Donations counted:      {target_donations}")
+    print(f"  Unique donor wallets:   {target_donors}")
     print(f"  Project sqrt-sum (S_p): {target_sqrt_sum:.4f}")
     print(f"  Project QF score:       {score:,.2f}")
     print(f"  Round score total:      {total_score:,.2f}")
