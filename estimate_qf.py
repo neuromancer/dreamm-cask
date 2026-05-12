@@ -130,7 +130,9 @@ def project_sqrt_sum(rows, badge_wallets=None):
     boosted = 0
     for r in rows:
         v = r["valueUsd"]
-        if r["addr"] and r["addr"] in badge_wallets:
+        is_badge_currency = r["currency"] in BADGE_TOKENS
+        is_badge_wallet = bool(r["addr"]) and r["addr"] in badge_wallets
+        if is_badge_currency or is_badge_wallet:
             sqrt_sum += math.sqrt(v * BADGE_MULTIPLIER)
             boosted += 1
         else:
