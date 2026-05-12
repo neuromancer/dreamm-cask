@@ -15,6 +15,14 @@ Method:
     (Note: this is NOT canonical QF, which would group by donor first. The
     impact-graph backend reproduces this script's number — verified against
     the live `projectDonationsSqrtSum` field.)
+
+    Round-specific weighting:
+    The Ethereum Security round (id 16) applies a 4× multiplier to donations
+    from "verified badge holders". Anyone who donated TIK or FINN tokens
+    counts as a badge holder. With --badge-boost the script does a first
+    pass across the round to identify badge wallets, then a second pass
+    that applies sqrt(4·v) for those donations.
+
     No COCM / passport / sybil clustering is applied here; that adjustment
     is run off-chain at distribution time by Giveth's COCM_QF_Algorithm.
 """
@@ -64,11 +72,14 @@ query D($projectId: Int!, $skip: Int, $take: Int, $qfRoundId: Int) {
     projectId: $projectId, skip: $skip, take: $take,
     orderBy: CreatedAt, orderDirection: ASC, qfRoundId: $qfRoundId
   ) {
-    donations { valueUsd fromWalletAddress }
+    donations { valueUsd currency fromWalletAddress }
     total
   }
 }
 """
+
+BADGE_TOKENS = {"TIK", "FINN"}
+BADGE_MULTIPLIER = 4.0
 
 
 def gql(query, variables=None, retries=5):
@@ -90,10 +101,8 @@ def gql(query, variables=None, retries=5):
     raise RuntimeError(f"GraphQL request failed: {last}")
 
 
-def project_sqrt_sum(project_id, qf_round_id):
-    sqrt_sum = 0.0
-    donations_counted = 0
-    donor_addrs = set()
+def project_donations(project_id, qf_round_id):
+    rows_out = []
     skip, take = 0, 200
     while True:
         d = gql(
@@ -102,23 +111,41 @@ def project_sqrt_sum(project_id, qf_round_id):
         )["donationsByProject"]
         for row in d["donations"]:
             v = row.get("valueUsd") or 0
-            if v > 0:
-                sqrt_sum += math.sqrt(v)
-                donations_counted += 1
-                addr = (row.get("fromWalletAddress") or "").lower()
-                if addr:
-                    donor_addrs.add(addr)
+            if v <= 0:
+                continue
+            rows_out.append({
+                "valueUsd": v,
+                "currency": (row.get("currency") or "").upper(),
+                "addr": (row.get("fromWalletAddress") or "").lower(),
+            })
         if skip + take >= d["total"]:
             break
         skip += take
-    return sqrt_sum, donations_counted, len(donor_addrs)
+    return rows_out
+
+
+def project_sqrt_sum(rows, badge_wallets=None):
+    sqrt_sum = 0.0
+    badge_wallets = badge_wallets or set()
+    boosted = 0
+    for r in rows:
+        v = r["valueUsd"]
+        if r["addr"] and r["addr"] in badge_wallets:
+            sqrt_sum += math.sqrt(v * BADGE_MULTIPLIER)
+            boosted += 1
+        else:
+            sqrt_sum += math.sqrt(v)
+    return sqrt_sum, boosted
 
 
 def main():
-    if len(sys.argv) != 3:
-        print("usage: estimate_qf.py <project-slug> <qf-round-id>", file=sys.stderr)
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    if len(args) != 2:
+        print("usage: estimate_qf.py [--no-badge-boost] <project-slug> <qf-round-id>", file=sys.stderr)
         sys.exit(2)
-    slug, round_id = sys.argv[1], int(sys.argv[2])
+    slug, round_id = args[0], int(args[1])
+    apply_badge_boost = "--no-badge-boost" not in flags
 
     project = gql(PROJECT_Q, {"slug": slug})["projectBySlug"]
     project_id = int(project["id"])
@@ -135,35 +162,55 @@ def main():
 
     projects = gql(PROJECTS_IN_ROUND_Q, {"filters": {"qfRoundId": round_id}})["projects"]["projects"]
     print(f"Round {round_id} '{round_info['name']}': {len(projects)} projects, pool ${pool_usd:,}")
-    print(f"Computing sqrt-sums for every project...")
 
-    total_score = 0.0
-    target_sqrt_sum = 0.0
-    target_donations = 0
-    target_donors = 0
+    print("Fetching donations for every project...")
+    all_donations = {}
     for i, p in enumerate(projects, 1):
         pid = int(p["id"])
         qf = next((r for r in p["projectQfRounds"] if r["qfRoundId"] == round_id), None)
         if not qf or (qf["sumDonationValueUsd"] or 0) <= 0:
             continue
-        s, donations, donors = project_sqrt_sum(pid, round_id)
+        all_donations[pid] = project_donations(pid, round_id)
+        if i % 20 == 0:
+            print(f"  fetched {i}/{len(projects)}")
+
+    badge_wallets = set()
+    if apply_badge_boost:
+        for rows in all_donations.values():
+            for r in rows:
+                if r["addr"] and r["currency"] in BADGE_TOKENS:
+                    badge_wallets.add(r["addr"])
+        print(f"Badge wallets identified (TIK/FINN donors): {len(badge_wallets)}")
+
+    total_score = 0.0
+    target_sqrt_sum = 0.0
+    target_donations = 0
+    target_donors = set()
+    target_boosted = 0
+    target_badge_donors = 0
+    for pid, rows in all_donations.items():
+        s, boosted = project_sqrt_sum(rows, badge_wallets if apply_badge_boost else set())
         total_score += s * s
         if pid == project_id:
             target_sqrt_sum = s
-            target_donations = donations
-            target_donors = donors
-        if i % 20 == 0:
-            print(f"  {i}/{len(projects)} projects done")
+            target_donations = len(rows)
+            target_donors = {r["addr"] for r in rows if r["addr"]}
+            target_boosted = boosted
+            target_badge_donors = len(target_donors & badge_wallets)
 
     score = target_sqrt_sum * target_sqrt_sum
     share = score / total_score if total_score else 0
     matching = share * pool_usd
 
     print()
-    print(f"=== {project['title']} — round {round_id} ({round_info['name']}) ===")
+    label = "with 4× badge boost" if apply_badge_boost else "vanilla (no boost)"
+    print(f"=== {project['title']} — round {round_id} ({round_info['name']}) — {label} ===")
     print(f"  Raised in round:        ${project_qf['sumDonationValueUsd']:,.2f}")
     print(f"  Donations counted:      {target_donations}")
-    print(f"  Unique donor wallets:   {target_donors}")
+    print(f"  Unique donor wallets:   {len(target_donors)}")
+    if apply_badge_boost:
+        print(f"  Badge donors (project): {target_badge_donors}")
+        print(f"  Boosted donation rows:  {target_boosted}")
     print(f"  Project sqrt-sum (S_p): {target_sqrt_sum:.4f}")
     print(f"  Project QF score:       {score:,.2f}")
     print(f"  Round score total:      {total_score:,.2f}")
